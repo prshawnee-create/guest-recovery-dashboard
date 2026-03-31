@@ -33,63 +33,63 @@ SEVERITY = ["Low", "Medium", "High", "Critical"]
 # -----------------------------
 # Google Sheets Helpers
 # -----------------------------
-@st.cache_data(ttl=600) # Cache data for 10 minutes
+@st.cache_data(ttl=300 ) # Cache data for 5 minutes
 def load_data():
-    conn = st.connection("gsheets", type=GSheetsConnection)
-    data = conn.read(spreadsheet=GSHEET_URL, worksheet="Sheet1", usecols=list(range(14)), ttl=5)
-    
-    # Check if data is empty or only contains headers
-    if data.empty:
-        return pd.DataFrame(columns=[
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        # We use ttl=0 here to ensure we get the latest data when the cache expires
+        data = conn.read(spreadsheet=GSHEET_URL, worksheet="Sheet1", ttl=0)
+        
+        if data is None or data.empty:
+            return pd.DataFrame(columns=[
+                "incident_date", "guest_name", "room", "department", "issue_type", "severity",
+                "description", "recovery_type", "recovery_value", "follow_up_required",
+                "owner", "root_cause", "corrective_action", "created_at", "id"
+            ])
+
+        # Ensure correct column names match your Google Sheet headers
+        expected_cols = [
             "incident_date", "guest_name", "room", "department", "issue_type", "severity",
             "description", "recovery_type", "recovery_value", "follow_up_required",
-            "owner", "root_cause", "corrective_action", "created_at", "id"
-        ])
-
-    # Ensure correct column names
-    data.columns = [
-        "incident_date", "guest_name", "room", "department", "issue_type", "severity",
-        "description", "recovery_type", "recovery_value", "follow_up_required",
-        "owner", "root_cause", "corrective_action", "created_at"
-    ]
-
-    # Ensure correct data types
-    data["incident_date"] = pd.to_datetime(data["incident_date"]).dt.date
-    data["created_at"] = pd.to_datetime(data["created_at"])
-    data["recovery_value"] = pd.to_numeric(data["recovery_value"], errors="coerce").fillna(0.0)
-    data["follow_up_required"] = data["follow_up_required"].astype(str).str.lower().isin(['true', '1', 'yes'])
-    
-    # Add an 'id' column based on row index
-    data['id'] = data.index + 1 
-    return data
-
-def append_incident(row_data: dict):
-    conn = st.connection("gsheets", type=GSheetsConnection)
-    # Convert boolean to string for Google Sheets
-    row_data["follow_up_required"] = str(row_data["follow_up_required"])
-    # Convert to DataFrame for appending
-    df_to_append = pd.DataFrame([row_data])
-    conn.create(spreadsheet=GSHEET_URL, worksheet="Sheet1", data=pd.concat([load_data().drop(columns=['id']), df_to_append], ignore_index=True))
-    st.cache_data.clear()
-
-def delete_incident_from_gsheets(incident_id: int):
-    conn = st.connection("gsheets", type=GSheetsConnection)
-    df = load_data()
-    if not df.empty and incident_id in df['id'].values:
-        # Filter out the row to delete
-        df_updated = df[df['id'] != incident_id].drop(columns=['id'])
+            "owner", "root_cause", "corrective_action", "created_at"
+        ]
         
-        # Format dates back to string for GSheets
-        df_updated["incident_date"] = df_updated["incident_date"].apply(lambda x: x.isoformat() if isinstance(x, date) else x)
-        df_updated["created_at"] = df_updated["created_at"].apply(lambda x: x.isoformat() if isinstance(x, datetime) else x)
-        df_updated["follow_up_required"] = df_updated["follow_up_required"].astype(str)
+        # If the sheet has more or fewer columns, we adjust
+        data = data.iloc[:, :len(expected_cols)]
+        data.columns = expected_cols
 
-        # Overwrite the sheet with the updated data
-        conn.create(spreadsheet=GSHEET_URL, worksheet="Sheet1", data=df_updated)
+        # Clean and format data
+        data["incident_date"] = pd.to_datetime(data["incident_date"], errors='coerce').dt.date
+        data["created_at"] = pd.to_datetime(data["created_at"], errors='coerce')
+        data["recovery_value"] = pd.to_numeric(data["recovery_value"], errors="coerce").fillna(0.0)
+        
+        # Convert follow_up to boolean safely
+        data["follow_up_required"] = data["follow_up_required"].astype(str).str.lower().isin(['true', '1', 'yes', 'checked'])
+        
+        # Add a unique ID based on the row index
+        data['id'] = data.index + 1 
+        return data
+    except Exception as e:
+        st.error(f"Error connecting to Google Sheets: {e}")
+        st.info("Please ensure your Google Sheet is shared as 'Anyone with the link can Edit'.")
+        return pd.DataFrame()
+
+def save_to_gsheets(df_to_save):
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        # Drop the helper 'id' column before saving back to the sheet
+        df_final = df_to_save.drop(columns=['id']) if 'id' in df_to_save.columns else df_to_save
+        
+        # Format columns for Google Sheets storage
+        df_final["incident_date"] = df_final["incident_date"].apply(lambda x: x.isoformat() if hasattr(x, 'isoformat') else str(x))
+        df_final["created_at"] = df_final["created_at"].apply(lambda x: x.isoformat() if hasattr(x, 'isoformat') else str(x))
+        
+        conn.update(spreadsheet=GSHEET_URL, worksheet="Sheet1", data=df_final)
         st.cache_data.clear()
-    else:
-        st.warning(f"Incident ID {incident_id} not found.")
-
+        return True
+    except Exception as e:
+        st.error(f"Failed to save data: {e}")
+        return False
 
 # -----------------------------
 # KPI Helpers
@@ -118,7 +118,7 @@ def top_repeats(df: pd.DataFrame, window_days=30, threshold=2):
 # UI Layout
 # -----------------------------
 st.title("Monthly Guest Recovery Dashboard")
-st.caption("Log incidents, track recovery cost, spot repeat issues, and close the loop.")
+st.caption("Connected to Google Sheets for permanent storage.")
 
 # -----------------------------
 # Sidebar Filters
@@ -178,24 +178,28 @@ with st.expander("➕ Log a new recovery incident", expanded=False):
 
         submitted = st.form_submit_button("Save incident")
         if submitted:
-            append_incident({
+            new_row = {
                 "incident_date": incident_date.isoformat(),
-                "guest_name": guest_name.strip() if guest_name else "",
-                "room": room.strip() if room else "",
+                "guest_name": guest_name.strip(),
+                "room": room.strip(),
                 "department": department,
                 "issue_type": issue_type,
                 "severity": severity,
-                "description": description.strip() if description else "",
+                "description": description.strip(),
                 "recovery_type": recovery_type,
                 "recovery_value": float(recovery_value),
-                "follow_up_required": bool(follow_up_required),
-                "owner": owner.strip() if owner else "",
-                "root_cause": root_cause.strip() if root_cause else "",
-                "corrective_action": corrective_action.strip() if corrective_action else "",
+                "follow_up_required": str(follow_up_required),
+                "owner": owner.strip(),
+                "root_cause": root_cause.strip(),
+                "corrective_action": corrective_action.strip(),
                 "created_at": datetime.now().isoformat(timespec="seconds")
-            })
-            st.success("Incident saved to Google Sheet.")
-            st.rerun()
+            }
+            
+            # Add to current dataframe and save
+            updated_df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+            if save_to_gsheets(updated_df):
+                st.success("Incident saved to Google Sheet.")
+                st.rerun()
 
 # -----------------------------
 # KPIs
@@ -222,67 +226,43 @@ left, right = st.columns([1.2, 0.8])
 with left:
     st.subheader("Trends")
     if filtered.empty:
-        st.info("No incidents in the selected date range yet.")
+        st.info("No incidents found for the selected filters.")
     else:
-        # Incidents by day
-        by_day = (
-            filtered.groupby("incident_date")["id"].count()
-            .reset_index(name="incidents")
-            .sort_values("incident_date")
-        )
+        by_day = filtered.groupby("incident_date")["id"].count().reset_index(name="incidents")
         st.line_chart(by_day, x="incident_date", y="incidents")
-
-        # Incidents by department
-        by_dept = (
-            filtered.groupby("department")["id"].count()
-            .reset_index(name="incidents")
-            .sort_values("incidents", ascending=False)
-        )
+        
+        by_dept = filtered.groupby("department")["id"].count().reset_index(name="incidents")
         st.bar_chart(by_dept, x="department", y="incidents")
 
 with right:
     st.subheader("Repeat Issues (last 30 days)")
     repeats = top_repeats(df, window_days=30, threshold=2)
     if repeats.empty:
-        st.success("No repeat issue types above the threshold in the last 30 days.")
+        st.success("No repeat issues detected.")
     else:
         st.dataframe(repeats, use_container_width=True, hide_index=True)
 
     st.subheader("Cost Drivers")
-    if filtered.empty:
-        st.write("—")
-    else:
-        by_issue_cost = (
-            filtered.groupby("issue_type")["recovery_value"].sum()
-            .reset_index(name="total_cost")
-            .sort_values("total_cost", ascending=False)
-            .head(8)
-        )
+    if not filtered.empty:
+        by_issue_cost = filtered.groupby("issue_type")["recovery_value"].sum().reset_index(name="total_cost").sort_values("total_cost", ascending=False).head(8)
         st.bar_chart(by_issue_cost, x="issue_type", y="total_cost")
 
 st.divider()
 
 # -----------------------------
-# Data Table + Export + Delete
+# Data Table
 # -----------------------------
 st.subheader("Incidents (filtered)")
-if filtered.empty:
-    st.write("No records to display.")
-else:
-    show_cols = [
-        "id", "incident_date", "department", "issue_type", "severity",
-        "recovery_type", "recovery_value", "follow_up_required", "owner",
-        "guest_name", "room", "description", "root_cause", "corrective_action"
-    ]
-    st.dataframe(filtered[show_cols].sort_values(["incident_date", "id"], ascending=[False, False]),
-                 use_container_width=True, hide_index=True)
-
-    csv = filtered[show_cols].to_csv(index=False).encode("utf-8")
+if not filtered.empty:
+    st.dataframe(filtered.sort_values("incident_date", ascending=False), use_container_width=True, hide_index=True)
+    
+    csv = filtered.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Download CSV", data=csv, file_name="recovery_dashboard_export.csv", mime="text/csv")
 
     with st.expander("🗑️ Delete a record (admin)"):
         incident_id = st.number_input("Incident ID to delete", min_value=1, step=1)
-        if st.button("Delete"):
-            delete_incident_from_gsheets(int(incident_id))
-            st.warning(f"Deleted incident ID {incident_id} from Google Sheet.")
-            st.rerun()
+        if st.button("Confirm Delete"):
+            updated_df = df[df['id'] != incident_id]
+            if save_to_gsheets(updated_df):
+                st.warning(f"Deleted incident ID {incident_id}.")
+                st.rerun()
