@@ -1,14 +1,14 @@
-import sqlite3
-from datetime import date, datetime, timedelta
 import pandas as pd
 import streamlit as st
+from datetime import date, datetime, timedelta
 
 # -----------------------------
 # App Config
 # -----------------------------
 st.set_page_config(page_title="Monthly Recovery Dashboard", layout="wide")
 
-DB_PATH = "recovery_dashboard.db"
+# Google Sheet URL provided by the user
+GSHEET_URL = "https://docs.google.com/spreadsheets/d/1voQfFNkNlGijKLcnyMaiCHCOQ9ckGQAZsqwHxTxUzJM/edit?usp=sharing"
 
 DEPARTMENTS = [
     "Front Desk", "Reservations", "River Room", "Gem & Keystone", "Kitchen",
@@ -30,78 +30,72 @@ SEVERITY = ["Low", "Medium", "High", "Critical"]
 
 
 # -----------------------------
-# Database Helpers
+# Google Sheets Helpers
 # -----------------------------
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+@st.cache_data(ttl=600) # Cache data for 10 minutes
+def load_data():
+    conn = st.connection("gsheets", type="v2")
+    data = conn.read(spreadsheet=GSHEET_URL, worksheet="Sheet1", usecols=list(range(14)), ttl=5)
+    data.columns = [
+        "incident_date", "guest_name", "room", "department", "issue_type", "severity",
+        "description", "recovery_type", "recovery_value", "follow_up_required",
+        "owner", "root_cause", "corrective_action", "created_at"
+    ]
+    if data.empty:
+        return pd.DataFrame(columns=data.columns)
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS incidents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            incident_date TEXT NOT NULL,
-            guest_name TEXT,
-            room TEXT,
-            department TEXT NOT NULL,
-            issue_type TEXT NOT NULL,
-            severity TEXT NOT NULL,
-            description TEXT,
-            recovery_type TEXT NOT NULL,
-            recovery_value REAL NOT NULL,
-            follow_up_required INTEGER NOT NULL,
-            owner TEXT,
-            root_cause TEXT,
-            corrective_action TEXT,
-            created_at TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
+    # Ensure correct data types
+    data["incident_date"] = pd.to_datetime(data["incident_date"]).dt.date
+    data["created_at"] = pd.to_datetime(data["created_at"])
+    data["recovery_value"] = pd.to_numeric(data["recovery_value"], errors="coerce").fillna(0.0)
+    data["follow_up_required"] = data["follow_up_required"].astype(str).str.lower().isin(['true', '1', 'yes'])
+    
+    # Add an 'id' column for consistency with original app, assuming index can serve as ID
+    data['id'] = data.index + 1 # Simple ID based on row number
+    return data
 
-def insert_incident(row: dict):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO incidents (
-            incident_date, guest_name, room, department, issue_type, severity,
-            description, recovery_type, recovery_value, follow_up_required,
-            owner, root_cause, corrective_action, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        row["incident_date"], row.get("guest_name"), row.get("room"),
-        row["department"], row["issue_type"], row["severity"],
-        row.get("description"), row["recovery_type"], row["recovery_value"],
-        1 if row["follow_up_required"] else 0,
-        row.get("owner"), row.get("root_cause"), row.get("corrective_action"),
-        row["created_at"]
-    ))
-    conn.commit()
-    conn.close()
+def append_incident(row_data: dict):
+    conn = st.connection("gsheets", type="v2")
+    # Convert boolean to string for Google Sheets
+    row_data["follow_up_required"] = str(row_data["follow_up_required"])
+    conn.append(pd.DataFrame([row_data]), spreadsheet=GSHEET_URL, worksheet="Sheet1")
+    st.cache_data.clear()
 
-def load_incidents():
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM incidents", conn)
-    conn.close()
-    if df.empty:
-        return df
-    # Parse dates
-    df["incident_date"] = pd.to_datetime(df["incident_date"]).dt.date
-    df["created_at"] = pd.to_datetime(df["created_at"])
-    df["follow_up_required"] = df["follow_up_required"].astype(int).astype(bool)
-    df["recovery_value"] = pd.to_numeric(df["recovery_value"], errors="coerce").fillna(0.0)
-    return df
+def delete_incident_from_gsheets(incident_id: int):
+    conn = st.connection("gsheets", type="v2")
+    df = load_data()
+    # Note: Deleting from Google Sheets is not as straightforward as SQLite.
+    # This approach reads all data, filters out the row, and writes back.
+    # For large datasets, this can be inefficient. A 'soft delete' (marking a row as deleted)
+    # or using a proper database is recommended for production.
+    if not df.empty and incident_id in df['id'].values:
+        # Get the actual index in the DataFrame (which corresponds to row number in GSheet - 1)
+        row_to_delete_idx = df[df['id'] == incident_id].index[0]
+        df_updated = df.drop(row_to_delete_idx)
+        
+        # Re-index the 'id' column for the remaining rows
+        df_updated['id'] = range(1, len(df_updated) + 1)
 
-def delete_incident(incident_id: int):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM incidents WHERE id = ?", (incident_id,))
-    conn.commit()
-    conn.close()
+        # Prepare data for writing back, excluding the 'id' column which is not in GSheet
+        cols_to_write = [
+            "incident_date", "guest_name", "room", "department", "issue_type", "severity",
+            "description", "recovery_type", "recovery_value", "follow_up_required",
+            "owner", "root_cause", "corrective_action", "created_at"
+        ]
+        # Convert date objects back to string for GSheets
+        df_updated["incident_date"] = df_updated["incident_date"].apply(lambda x: x.isoformat() if isinstance(x, date) else x)
+        df_updated["created_at"] = df_updated["created_at"].apply(lambda x: x.isoformat() if isinstance(x, datetime) else x)
+        df_updated["follow_up_required"] = df_updated["follow_up_required"].astype(str)
+
+        conn.clear(spreadsheet=GSHEET_URL, worksheet="Sheet1") # Clear existing data
+        conn.append(df_updated[cols_to_write], spreadsheet=GSHEET_URL, worksheet="Sheet1", headers=True) # Write back with headers
+        st.cache_data.clear()
+    else:
+        st.warning(f"Incident ID {incident_id} not found.")
+
 
 # -----------------------------
-# KPI Helpers
+# KPI Helpers (unchanged)
 # -----------------------------
 def month_bounds(d: date):
     first = d.replace(day=1)
@@ -122,9 +116,9 @@ def top_repeats(df: pd.DataFrame, window_days=30, threshold=2):
     return counts[counts["count"] >= threshold]
 
 # -----------------------------
-# Initialize
+# Initialize (no longer needed for DB, but load data)
 # -----------------------------
-init_db()
+# init_db() # No longer needed for SQLite
 
 st.title("Monthly Guest Recovery Dashboard")
 st.caption("Log incidents, track recovery cost, spot repeat issues, and close the loop.")
@@ -132,7 +126,7 @@ st.caption("Log incidents, track recovery cost, spot repeat issues, and close th
 # -----------------------------
 # Sidebar Filters
 # -----------------------------
-df = load_incidents()
+df = load_data()
 
 today = date.today()
 default_start, default_end = month_bounds(today)
@@ -188,7 +182,7 @@ with st.expander("➕ Log a new recovery incident", expanded=False):
 
         submitted = st.form_submit_button("Save incident")
         if submitted:
-            insert_incident({
+            append_incident({
                 "incident_date": incident_date.isoformat(),
                 "guest_name": guest_name.strip() if guest_name else None,
                 "room": room.strip() if room else None,
@@ -204,7 +198,7 @@ with st.expander("➕ Log a new recovery incident", expanded=False):
                 "corrective_action": corrective_action.strip() if corrective_action else None,
                 "created_at": datetime.now().isoformat(timespec="seconds")
             })
-            st.success("Incident saved.")
+            st.success("Incident saved to Google Sheet.")
             st.rerun()
 
 # -----------------------------
@@ -293,6 +287,6 @@ else:
     with st.expander("🗑️ Delete a record (admin)"):
         incident_id = st.number_input("Incident ID to delete", min_value=1, step=1)
         if st.button("Delete"):
-            delete_incident(int(incident_id))
-            st.warning(f"Deleted incident ID {incident_id}.")
+            delete_incident_from_gsheets(int(incident_id))
+            st.warning(f"Deleted incident ID {incident_id} from Google Sheet.")
             st.rerun()
